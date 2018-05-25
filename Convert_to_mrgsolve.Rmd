@@ -1,0 +1,474 @@
+---
+title: "Berkeley Madonna Conversion (first draft)"
+author: "Mike K Smith"
+date: "25 May 2018"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Getting BM Equations
+Open the .mmd file in Berkeley Madonna and then from the "File" menu choose
+"Save equations as..." and save the equations in .txt format.
+
+## Read Berkeley Madonna file
+*** Comments *** 
+BM uses `;` or `{ ... }` as the comment delimiters. To facilitate conversion I have
+omitted all comments from the text before processing. 
+
+```{r readLines, message = FALSE, warning = FALSE}
+library(tidyverse, quietly = TRUE)
+txt <- readLines("Calcium Osc (phase Plane) Equations.txt") %>%
+  str_replace("\\s","") %>%
+  str_trim() %>%
+  str_replace(";.*", "") %>%
+  str_replace("\\{.*","") %>%
+  .[. != ""]
+
+head(txt)
+```
+### Convert ODEs to mrgsolve format
+*** mrgsolve block ***  
+The \$ODE block in mrgsolve contains the ODEs for the "compartments".
+
+*** Assumptions ***  
+LHS of the ODE contains the ODE compartment variable name.
+RHS of the ODE can contain either other compartment variables / ODE amounts, 
+model parameters and inputs / covariates.
+
+*** Conversion detail ***  
+BM ODEs in this text are of the form: `d/dt( <var> ) = ...`.
+For mrgsolve they should be `dxdt_var = ...`
+
+Pattern `\\(|\\)|\\*|\\/|\\-|\\+|\\>` should remove arithmetic relationships 
+leaving only variable names and constants.
+
+```{r mrgsolveODEs}
+ODE_lines <- stringr::str_detect(txt, pattern="d/dt *\\( *")
+
+ODEs <- txt[ODE_lines] %>% 
+  stringr::str_replace(pattern = "d/dt *\\( *", replacement = "dxdt_") %>%
+  stringr::str_replace(pattern = " *\\) *", replacement = "")
+
+ODE_cmts <- stringr::word(ODEs,1,sep="=") %>%
+  stringr::word(2,sep="_") %>%
+  .[!is.na(.)]
+
+print("$ODE")
+ODEs
+print("$CMT")
+ODE_cmts
+
+## Determine if character string is numeric or other
+is_nonmissing_number <- function(x)!is.na(as.numeric(x))
+
+## Take RHS of assignments and remove arithmetic operators
+##   THEN reduce to the set of variables used in ODEs.
+##   Eliminate any numeric constants
+
+pattern <- "\\(|\\)|\\*|\\/|\\-|\\+|\\>|\\^"
+ODE_vars <- ODEs %>%
+  stringr::word(start=2, sep=" *= *") %>%
+  stringr::str_replace_all(pattern = pattern, replacement = " ") %>%
+  stringr::str_split(pattern = "[:space:]") %>%
+  unlist() %>%
+  unique() %>%
+  .[.!=""] %>%
+  .[!is_nonmissing_number(.)]
+
+## Eliminate RHS variables that are compartments
+ODE_vars <- ODE_vars[!(ODE_vars %in% ODE_cmts)]
+
+print("Variables & parameters used in ODEs")
+ODE_vars
+```
+
+### Find initial conditions
+*** mrgsolve block ***  
+For mrgsolve, if the initial condition = 0 then this compartment is initialized
+in a \$CMT block. Otherwise it is initialized in a \$INIT block.
+
+*** Assumptions ***  
+BM has lines beginning with `init` to signify that these initialise ODE 
+compartments. BM treats initialising with zero amount and initialising with
+non-zero amount equivalently.
+
+LHS of assignment should be an ODE variable (after the `init` statement).
+RHS of assignment could be zero or could be a decimal amount.
+
+*** Conversion details ***   
+Assuming that lines begin `init <ODE_var>`. So ODE_var to be initialized is 
+second "word".
+
+Assuming only decimal values for non-zero initialized variables (rather than
+assignment to a variable).
+
+```{r initial_conditions}
+## Initialisation lines start with "init"
+init_lines <- casefold(txt, upper = FALSE) %>%
+  stringr::str_detect(pattern = "^ *init")
+
+if(sum(init_lines)>0){
+  initialized <- txt[init_lines]
+  
+  initialized_vars <- stringr::word(initialized,1,sep="=") %>%
+    stringr::word(2)
+  
+  # Take the RHS after the assignment and before the comment
+  value <- initialized %>%
+    stringr::word(2,sep="= *") %>%
+    as.numeric()
+  
+  ## Only those initialisation lines where the value is non-zero
+  ## These are initialised in $INITS block
+  inits <- gsub("^ *init ", "", initialized[value != 0])
+  
+  print("$INITS")
+  inits
+}
+
+## if the initialisation is to zero, then these are defined in $CMT block
+cmts <- initialized[value==0]
+if(length(cmts)>0){
+  str_replace("^ *init ", "") %>%
+  stringr::word(1,sep="=")
+
+  print("$CMT")
+  cmts
+}
+
+```
+
+Next check if there are ODE compartments for which there is no value for initial 
+condition.
+```{r noInitialValue_ODE_vars}
+uninitialized <- ODE_cmts[!is.element(ODE_cmts,initialized_vars)]
+if(length(uninitialized) == 0) print("All compartments initialised")else(
+    print(paste("The following compartments are uninitialized",uninitialized))
+  )
+```
+
+### Tidy remaining assignments
+There are many assignments that are fixed values, some expressed as fractions,
+and some IF...THEN...ELSE statements.
+
+*** Assumptions ***  
+For IF...THEN...ELSE statements, then the "if" is the first "word" after the 
+assignment statement i.e. "... = if ...".
+
+*** Conversion details ***  
+Look for assignment statements, and eliminate any that have IF...THEN...ELSE
+structure.
+
+Of those that remain, use eval(parse(<text>)) to attempt to calculate the RHS
+of the assignment. Keep only those that work. $FIXED can take arithmetic 
+assignment but not assignment to variables.
+
+```{r tidyAssignments}
+assignments <- txt[!(ODE_lines | init_lines)] %>%
+  stringr::str_subset(pattern = " *= *")
+
+assigned_vars <- assignments %>%
+  stringr::word(start=1, sep=" *= *")
+
+## Handle IF...THEN...ELSE statements
+uses_if <- assignments %>%
+  stringr::word(start=2, sep=" *= *") %>%
+  stringr::str_detect(pattern="^ *if")
+
+if_statements <- assignments[uses_if] %>%
+  stringr::str_replace(" *if *","") %>%
+  stringr::str_replace(" *then *"," ? ") %>%
+  stringr::str_replace(" *else *"," : ")
+
+if_vars <- assigned_vars[uses_if]
+
+assignments2 <- assignments[!uses_if] 
+
+RHS_works <- assignments2 %>%
+  stringr::word(start=2, sep=" *= *") %>%
+  map(~ try(eval(parse(text=.)),silent = TRUE)) %>%
+  map( ~ !inherits(., "try-error")) %>%
+  unlist()
+
+fixed = assignments2[RHS_works]
+
+fixed_vars <- assignments2[RHS_works] %>%
+  stringr::word(.,start=1, sep=" *= *")  
+```
+
+### Separate \$MAIN, \$ODE and \$TABLE variables
+***mrgsolve block***  
+The mrgsolve \$MAIN block is analogous to the NONMEM \$PK block. This block 
+defines variables that combine parameters, fixed values etc. Equations in this
+block are evaluated just prior to advancing the ODEs in time.
+
+The \$ODE block should contain variable which use compartment amounts, where 
+those variables are themselves used in calculations of compartment amounts. 
+Equations in this block are evaluated at each advancement of the ODEs.
+
+The \$TABLE block can take variables which use ODE compartment amounts, or 
+other variables, but these should not be used in definition or calculation of
+ODE amounts or variables. Equations in the \$TABLE block are evaluated ***after***
+the ODEs are advanced.
+
+*** Asssumptions ***  
+There are a few cases for \$MAIN variable definition:  
+  1. functions of \$FIXED variables.
+  2. functions of \$PARAM parameters.
+  
+For \$ODE variable definitions, they may use compartment amounts, but will also
+define variables used within the system of ODEs.
+
+\$TABLE variables may use any of the model variables, but these should not 
+define any variables that are used in calculation of ODE variables or amounts.
+
+Assignments which use ODEs compartment variables can either be:  
+  * variables and values needed for \$ODE block specification OR
+  * output variables which should be specified in the \$TABLE block.
+  
+If the variable uses ODE compartments in the RHS of the assignment AND the LHS
+is NOT used in calculation of ODE amounts THEN we will assume this value is used
+in \$TABLE.
+
+*** Conversion details ***  
+Look at RHS of assignments for \$FIXED variables or constants (numerics). These
+should go into \$MAIN.
+
+Determine if the RHS of the assignment contains an ODE compartment variable THEN
+if the LHS is not used in calculation of ODEs (i.e. in ODE_vars set) AND is not
+used in RHS assignment of ODE variables then push to \$TABLE.
+
+```{r warning=FALSE, message=FALSE}
+remainder <- assignments[!is.element(assigned_vars, fixed_vars)|uses_if]
+remainder_vars <- remainder %>%
+  stringr::word(start=1, sep=" *= *")
+
+# subset uses_if to match remainder
+uses_if <- uses_if[!is.element(assigned_vars, fixed_vars)|uses_if]
+
+## Take RHS and find variables that need defined
+pattern <- "\\(|\\)|\\*|\\/|\\-|\\+|\\>|\\?|\\:|\\^"
+RHS1 <- remainder %>%
+  stringr::word(start=2, sep=" *= *") %>%
+  stringr::word(start=1, sep=" *#|;") %>%
+  stringr::str_replace_all(pattern = pattern, replacement = " ") %>%
+  stringr::str_replace_all(pattern = "\\s+", replacement = " ") %>%
+  stringr::str_replace_all(pattern = " *if *", replacement = " ") %>%
+  stringr::str_replace_all(pattern = " *then *", replacement = " ") %>%
+  stringr::str_replace_all(pattern = " *else *", replacement = " ") %>%
+  stringr::str_trim() %>%
+  stringr::str_split(pattern = "[:space:]")
+names(RHS1) <- remainder_vars
+
+## Determine whether elements on RHS are functions of numbers and fixed variables 
+is_simple <- sapply(RHS1,function(x){
+  all(is_nonmissing_number(x) | x %in% fixed_vars)
+})
+
+main1 <- c(remainder[is_simple],if_statements)
+main_vars1 <- c(remainder_vars[is_simple], if_vars)
+
+remainder2 <- remainder[!(is_simple | uses_if)]
+remainder2_vars <- remainder_vars[!(is_simple | uses_if)]
+RHS2 <- RHS1[!(is_simple | uses_if)]
+
+## Determine if remaining assignments use ODE compartment variables
+uses_cmts <- RHS2 %>%
+  stringr::str_detect(pattern = paste( ODE_cmts, collapse="|"))
+
+uses_cmt_assignments <- remainder2[uses_cmts]
+uses_cmt_vars <- remainder2_vars[uses_cmts]
+
+## Determine if assignment defines variable used in ODEs
+defines_ODE_variable <- is.element(uses_cmt_vars,ODE_vars)
+
+ODE_assignments <- uses_cmt_assignments[defines_ODE_variable] %>%
+  paste("double", . )
+ODE_assignment_vars <- uses_cmt_vars[defines_ODE_variable]
+
+ode <- c(ODEs, ODE_assignments)
+
+## Determine if assignment defines variable used in 
+##   definition of variable used in ODE
+remainder3 <- remainder2[!defines_ODE_variable]
+remainder3_vars <- remainder2_vars[!defines_ODE_variable]
+
+used_by_ODE_var <- stringr::str_detect(RHS2[defines_ODE_variable],
+                                       remainder3_vars)
+
+main2 <- remainder3[used_by_ODE_var]
+main2_vars <- remainder3_vars[used_by_ODE_var]
+# 
+# remainder3 <- remainder2[!uses_cmts]
+# remainder3_vars <- remainder2_vars[!uses_cmts]
+# RHS3 <- RHS2[!uses_cmts]
+# 
+# main2 <- remainder3[defines_ODE_var]
+# main_vars2 <- remainder3_vars[defines_ODE_var]
+
+## 
+table1 <- uses_cmt_assignments[!defines_ODE_variable]
+table_vars1 <- uses_cmt_vars[!defines_ODE_variable]
+
+table2 <- remainder3[!defines_ODE_variable]
+table_vars2 <- remainder3_vars[!defines_ODE_variable]
+```
+### \$ODE parameters to \$PARAM, all others to \$FIXED
+Of the assigned variables, we can push any that are referenced in 
+RHS of ODE equations to the \$PARAM block, and the remainder to \$FIXED. 
+
+*** mrgsolve blocks ***  
+mrgsolve has the \$PARAM block for any parameters used in the ODE equations. 
+These parameters need to be declared and can be fixed to a value in this block.
+All other fixed values for the model can be specified in the \$FIXED block.
+
+```{r Parameters_and_Fixed}
+parameters <- fixed[is.element(fixed_vars, ODE_vars)]
+if(length(parameters)>0){
+  print("$PARAM")
+  parameters
+}
+
+fixed2 <- fixed[!is.element(fixed_vars, ODE_vars)]
+fixed_vars2 <- fixed_vars[!is.element(fixed_vars, ODE_vars)]
+
+all_RHS_vars <- c(ODE_vars, unique(unlist(RHS1)))
+fixed3 <- fixed2[is.element(fixed_vars2, all_RHS_vars)]
+if(length(fixed3)>0){
+  print("$FIXED")
+  fixed3
+}
+```
+
+### Find \$TABLE variables
+***mrgsolve block***  
+mrgsolve has a \$TABLE block to define variables that are calculated after the 
+ODEs advance.
+
+*** Assumptions ***  
+Any assignments that aren't already covered should be in the \$TABLE block.
+
+```{r findTableParameters}
+table <- c(table1, table2)
+if(length(table)>0){
+  print("$TABLE")
+  table
+}
+```
+
+### Find \$CAPTURE parameters
+*** mrgsolve block ***  
+mrgsolve uses the \$CAPTURE block to return values from the simulation. These 
+are typically derived variables that combine other parameters and amounts.
+
+*** Assumptions ***  
+Looking for LHS variables that are not used on the RHS of 
+assignments i.e. end of the computational chain.
+
+*** Conversion details ***  
+
+```{r findCapture}
+## Look for lines where table variables are used on the RHS
+pattern <- "\\(|\\)|\\*|\\/|\\-|\\+|\\>"
+usedVars <- table %>%
+  stringr::word(start=2, sep=" *= *") %>%
+  stringr::word(start=1, sep=" *#|;") %>%
+  stringr::str_replace_all(pattern = pattern, replacement = " ") %>%
+  stringr::str_split(pattern = "[:space:]") %>%
+  unlist() %>%
+  unique() %>%
+  .[.!=""]
+
+defined_lines <- table %>% 
+  stringr::word(1,sep=" *= *") %>%
+  is.element(.,usedVars)
+
+capture <- table[!defined_lines]
+capture_vars <- stringr::word(capture,1,sep=" *= *")
+if(length(capture)>0){
+  print("$CAPTURE")
+  capture_vars
+}
+```
+
+## Print out
+```{r print}
+out <- c("$PROB","Lanzieri et al CMV vaccine strategy model")
+
+if(length(parameters)>0){
+  out <- c(out, "$PARAM",
+           parameters %>%
+             stringr::str_trim() 
+  )
+}
+
+if(length(inits)>0){
+  out <- c(out, "$INIT",
+           inits %>%
+             stringr::str_trim()
+  )
+}
+
+if(length(cmts)>0){
+  out <-  c(out, "$CMT",
+            cmts %>%
+              stringr::str_trim()
+  )
+}
+
+if(length(fixed3)>0){
+  out <-  c(out, "$FIXED",
+            fixed3 %>% 
+              stringr::str_trim()
+  )
+}
+
+if(length(c(main1, main2))>0){
+  out <- c(out, "$MAIN",
+           c(main1, main2) %>%
+             paste("double ", ., " ;", sep="") 
+  )
+}
+
+if(length(ode)>0){
+  out <-  c(out, "$ODE",
+            ode %>%
+              paste(., " ;", sep="") 
+  )
+}
+
+if(length(table)>0){
+  out <- c(out, "$TABLE",
+           table %>%
+             paste("double ", ., " ;", sep="")
+  )
+}
+
+if(length(capture)>0){
+  out <- c(out, "$CAPTURE",
+           capture_vars %>%
+             stringr::str_trim() 
+  )
+}
+
+out
+```
+
+## Write to file
+```{r write_to_file}
+fileConn<-file("Calcium_Osc.cpp")
+writeLines(out, fileConn)
+close(fileConn)
+```
+
+## Test model file with mrgsolve
+```{r test}
+Sys.setenv(PATH=paste0("c:/program files/R/R-3.4.1/bin/x64/;",
+                       "c:/RTools/bin/;",
+                       "c:/RTools/mingw_64/bin/;",
+                       Sys.getenv("PATH")))
+
+library(mrgsolve)
+mod <- mread("Calcium_Osc")
+```

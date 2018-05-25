@@ -1,0 +1,30 @@
+{Top model}
+
+   {Reservoirs}
+   d/dt (Z) = + dzdt
+      INIT Z = 1.4
+   d/dt (Y) = + dydt
+      INIT Y = 1.4
+
+   {Flows}
+   dzdt = v0+v1*beta-v2+v3+kf*Y-k*Z
+   dydt = v2-v3-kf*Y
+
+   {Functions}
+   v0 = 1
+   beta = .3
+   v1 = 7.3
+   v3 = (vm3*Z^p*Y^m)/((kr^m+Y^m)*(ka^p+Z^p))
+   kf = 1
+   p = 4
+   vm3 = 500
+   kr = 2
+   ka = .9
+   m = 2
+   v2 = (vm2*Z^n)/(k2^n + Z^n)
+   vm2 = 65
+   k2 = 1
+   n = 2
+   k = 10
+{Globals}
+{End Globals}
